@@ -230,10 +230,11 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		// See https://docs.docker.com/engine/reference/commandline/pull/#pull-an-image-by-digest-immutable-identifier.
 		done := m.collector.writing()
 		m.store.PutManifest(repo, h, mf)
+		m.collector.TouchManifest(repo, h)
 		if target != h.String() {
 			m.store.PutTag(repo, target, h)
+			m.collector.PushTag(repo, target)
 		}
-		m.touch(repo, target, h)
 		// Record the blobs this manifest names, even ones no client has asked
 		// for yet: it is what lets eviction reason about them, and what lets a
 		// blob's metadata be dropped once nothing names it any more.
