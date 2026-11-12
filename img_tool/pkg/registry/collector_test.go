@@ -530,3 +530,166 @@ func assertLiveBlobs(t *testing.T, collector *Collector, want ...v1.Hash) {
 		}
 	}
 }
+
+// pushImage stores a distinct image in repo under tags, as a push would.
+func pushImage(t *testing.T, store Store, collector *Collector, repo, seed string, tags ...string) v1.Hash {
+	t.Helper()
+	image := imageManifest(t, seed, descriptorFor(types.OCIConfigJSON, "config-"+seed))
+	digest := digestOf(t, image)
+	store.PutManifest(repo, digest, Manifest{Kind: KindManifest, Blob: image})
+	collector.TouchManifest(repo, digest)
+	for _, tag := range tags {
+		store.PutTag(repo, tag, digest)
+		collector.PushTag(repo, tag)
+	}
+	return digest
+}
+
+func TestCollectorKeepsTheNewestImagesPerRepo(t *testing.T) {
+	clock := newTestClock()
+	store := NewMemStore()
+	collector := NewCollector(store, CollectorConfig{TTL: time.Minute, TagTTL: time.Hour, TagKeepLast: 2, Clock: clock.Now})
+
+	first := pushImage(t, store, collector, "app", "1", "20261001.000000-aaaaaaa")
+	clock.advance(time.Second)
+	second := pushImage(t, store, collector, "app", "2", "20261002.000000-bbbbbbb")
+	clock.advance(time.Second)
+	// latest and a dated tag on the same build are one image, not two slots.
+	third := pushImage(t, store, collector, "app", "3", "20261003.000000-ccccccc", "latest")
+	other := pushImage(t, store, collector, "other", "4", "v1")
+
+	clock.advance(2 * time.Minute)
+	stats := collector.Collect()
+	if stats.Tags != 1 || stats.Manifests != 1 {
+		t.Fatalf("collecting removed %+v, want the oldest image's 1 tag and 1 manifest", stats)
+	}
+	assertNotHeld(t, store, "app", first)
+	assertHeld(t, store, "app", second, third)
+	assertHeld(t, store, "other", other)
+
+	// The newest images stay whatever their age: TagTTL only bounds older ones.
+	clock.advance(48 * time.Hour)
+	if stats := collector.Collect(); stats != (CollectStats{}) {
+		t.Fatalf("collecting removed %+v from the newest images, want nothing", stats)
+	}
+}
+
+func TestCollectorKeepsAnOlderImageWhileItIsRead(t *testing.T) {
+	clock := newTestClock()
+	store := NewMemStore()
+	collector := NewCollector(store, CollectorConfig{TTL: time.Minute, TagTTL: time.Hour, TagKeepLast: 1, Clock: clock.Now})
+
+	pinned := pushImage(t, store, collector, "app", "pinned", "v1")
+	clock.advance(time.Second)
+	pushImage(t, store, collector, "app", "newer", "v2")
+
+	// A deployment pinned to v1 keeps reading it, so it outlives its slot.
+	for range 3 {
+		clock.advance(50 * time.Minute)
+		collector.TouchTag("app", "v1")
+		if stats := collector.Collect(); stats != (CollectStats{}) {
+			t.Fatalf("collecting removed %+v from a tag still being read, want nothing", stats)
+		}
+	}
+	assertHeld(t, store, "app", pinned)
+
+	clock.advance(61 * time.Minute)
+	if stats := collector.Collect(); stats.Tags != 1 || stats.Manifests != 1 {
+		t.Fatalf("collecting removed %+v once v1 went unread, want 1 tag and 1 manifest", stats)
+	}
+	assertNotHeld(t, store, "app", pinned)
+}
+
+// pushTimesStore is a Store that remembers push times, as s3store does after Open.
+type pushTimesStore struct {
+	Store
+	pushed map[string]time.Time
+}
+
+func (s pushTimesStore) TagPushedAt(repo, tag string) (time.Time, bool) {
+	pushed, ok := s.pushed[repo+":"+tag]
+	return pushed, ok
+}
+
+func TestCollectorRanksAdoptedTagsByTheStoresPushTimes(t *testing.T) {
+	clock := newTestClock()
+	mem := NewMemStore()
+	base := clock.Now()
+	store := pushTimesStore{Store: mem, pushed: map[string]time.Time{
+		// Name order says b is newer; the store knows a was pushed last.
+		"app:a": base.Add(-time.Hour),
+		"app:b": base.Add(-2 * time.Hour),
+	}}
+	collector := NewCollector(store, CollectorConfig{TTL: time.Minute, TagTTL: time.Hour, TagKeepLast: 1, Clock: clock.Now})
+
+	// Loaded at startup: present in the store, never seen by this Collector.
+	var digests []v1.Hash
+	for _, tag := range []string{"a", "b"} {
+		image := imageManifest(t, tag, descriptorFor(types.OCIConfigJSON, "config-"+tag))
+		digest := digestOf(t, image)
+		mem.PutManifest("app", digest, Manifest{Kind: KindManifest, Blob: image})
+		mem.PutTag("app", tag, digest)
+		digests = append(digests, digest)
+	}
+
+	if stats := collector.Collect(); stats != (CollectStats{}) {
+		t.Fatalf("the sweep that adopts the tags removed %+v, want nothing", stats)
+	}
+	clock.advance(61 * time.Minute)
+	if stats := collector.Collect(); stats.Tags != 1 {
+		t.Fatalf("collecting removed %d tags, want 1", stats.Tags)
+	}
+	if _, ok := mem.ResolveTag("app", "a"); !ok {
+		t.Fatal("the most recently pushed tag was collected")
+	}
+	assertNotHeld(t, mem, "app", digests[1])
+}
+
+func TestCollectorBreaksPushTiesByTagName(t *testing.T) {
+	clock := newTestClock()
+	store := NewMemStore()
+	collector := NewCollector(store, CollectorConfig{TTL: time.Minute, TagTTL: time.Hour, TagKeepLast: 1, Clock: clock.Now})
+
+	older := pushImage(t, store, collector, "app", "1", "20261001.000000-aaaaaaa")
+	newer := pushImage(t, store, collector, "app", "2", "20261002.000000-bbbbbbb")
+
+	clock.advance(2 * time.Hour)
+	collector.Collect()
+	assertHeld(t, store, "app", newer)
+	assertNotHeld(t, store, "app", older)
+}
+
+func TestCollectorDoesNotGiveADanglingTagASlot(t *testing.T) {
+	clock := newTestClock()
+	store := NewMemStore()
+	collector := NewCollector(store, CollectorConfig{TTL: time.Minute, TagTTL: time.Hour, TagKeepLast: 1, Clock: clock.Now})
+
+	kept := pushImage(t, store, collector, "app", "1", "v1")
+	clock.advance(time.Second)
+	store.PutTag("app", "v2", descriptorFor(types.OCIManifestSchema1, "never pushed").Digest)
+	collector.PushTag("app", "v2")
+
+	clock.advance(2 * time.Hour)
+	if stats := collector.Collect(); stats.Tags != 1 {
+		t.Fatalf("collecting removed %d tags, want only the dangling one", stats.Tags)
+	}
+	assertHeld(t, store, "app", kept)
+}
+
+func TestCollectorMaybeCollectRunsWithOnlyTagKeepLast(t *testing.T) {
+	clock := newTestClock()
+	store := NewMemStore()
+	collector := NewCollector(store, CollectorConfig{TagKeepLast: 1, Interval: time.Minute, Clock: clock.Now})
+
+	older := pushImage(t, store, collector, "app", "1", "v1")
+	clock.advance(time.Second)
+	pushImage(t, store, collector, "app", "2", "v2")
+
+	clock.advance(time.Minute)
+	collector.MaybeCollect()
+	if _, ok := store.ResolveTag("app", "v1"); ok {
+		t.Fatal("MaybeCollect never swept: the unread older tag still resolves")
+	}
+	// TTL 0 keeps untagged manifests, so only the tag goes.
+	assertHeld(t, store, "app", older)
+}

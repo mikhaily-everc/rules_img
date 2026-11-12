@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"sync"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -93,6 +94,12 @@ type Store interface {
 	// RangeTags calls fn for every tag in repo, stopping early if fn returns
 	// false.
 	RangeTags(repo string, fn func(tag string, digest v1.Hash) bool)
+}
+
+// TagPushTimes is implemented by a Store that remembers when each tag was last
+// written, so a Collector started over it can rank images it never saw pushed.
+type TagPushTimes interface {
+	TagPushedAt(repo, tag string) (time.Time, bool)
 }
 
 // memStore is the default Store: everything in memory, for the lifetime of the

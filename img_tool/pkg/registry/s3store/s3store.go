@@ -92,9 +92,17 @@ type Store struct {
 
 	failMu   sync.Mutex
 	failures int
+
+	// loadedPushes is each tag's LastModified as listed at Open, which is when
+	// it was last pushed: a read never rewrites a tag object.
+	pushMu       sync.Mutex
+	loadedPushes map[string]time.Time
 }
 
-var _ registry.Store = (*Store)(nil)
+var (
+	_ registry.Store        = (*Store)(nil)
+	_ registry.TagPushTimes = (*Store)(nil)
+)
 
 // Open loads every manifest and tag stored under bucket/prefix and returns a
 // Store that writes subsequent changes back there. A prefix of "" uses the
@@ -107,7 +115,7 @@ func Open(ctx context.Context, client Client, bucket, prefix string, cfg Config)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	s := &Store{mem: registry.NewMemStore(), client: client, bucket: bucket, prefix: prefix, cfg: cfg}
+	s := &Store{mem: registry.NewMemStore(), client: client, bucket: bucket, prefix: prefix, cfg: cfg, loadedPushes: make(map[string]time.Time)}
 	if err := s.load(ctx); err != nil {
 		return nil, err
 	}
@@ -163,8 +171,9 @@ func parseTagKey(rel string) (string, string, error) {
 	return rest[:i], rest[i+1:], nil
 }
 
-func (s *Store) list(ctx context.Context, dir string) ([]string, error) {
+func (s *Store) list(ctx context.Context, dir string) ([]string, map[string]time.Time, error) {
 	var keys []string
+	modified := make(map[string]time.Time)
 	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(s.prefix + dir),
@@ -172,13 +181,16 @@ func (s *Store) list(ctx context.Context, dir string) ([]string, error) {
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("s3store: listing s3://%s/%s%s: %w", s.bucket, s.prefix, dir, err)
+			return nil, nil, fmt.Errorf("s3store: listing s3://%s/%s%s: %w", s.bucket, s.prefix, dir, err)
 		}
 		for _, obj := range page.Contents {
 			keys = append(keys, aws.ToString(obj.Key))
+			if obj.LastModified != nil {
+				modified[aws.ToString(obj.Key)] = *obj.LastModified
+			}
 		}
 	}
-	return keys, nil
+	return keys, modified, nil
 }
 
 func (s *Store) get(ctx context.Context, key string) ([]byte, *s3.GetObjectOutput, error) {
@@ -192,11 +204,11 @@ func (s *Store) get(ctx context.Context, key string) ([]byte, *s3.GetObjectOutpu
 }
 
 func (s *Store) load(ctx context.Context) error {
-	manifestKeys, err := s.list(ctx, manifestsDir)
+	manifestKeys, _, err := s.list(ctx, manifestsDir)
 	if err != nil {
 		return err
 	}
-	tagKeys, err := s.list(ctx, tagsDir)
+	tagKeys, tagModified, err := s.list(ctx, tagsDir)
 	if err != nil {
 		return err
 	}
@@ -264,6 +276,9 @@ func (s *Store) load(ctx context.Context) error {
 			continue
 		}
 		s.mem.PutTag(repo, tag, digest)
+		if modified, ok := tagModified[key]; ok {
+			s.loadedPushes[s.TagKey(repo, tag)] = modified
+		}
 	}
 	log.Printf("s3store: loaded %d manifest(s) and %d tag(s) from s3://%s/%s", len(manifestKeys), len(tagKeys), s.bucket, s.prefix)
 	return nil
@@ -349,11 +364,28 @@ func (s *Store) ResolveTag(repo, tag string) (v1.Hash, bool) { return s.mem.Reso
 func (s *Store) PutTag(repo, tag string, digest v1.Hash) {
 	s.put(s.TagKey(repo, tag), []byte(digest.String()), "text/plain", nil)
 	s.mem.PutTag(repo, tag, digest)
+	s.forgetPush(repo, tag)
 }
 
 func (s *Store) DeleteTag(repo, tag string) {
 	s.mem.DeleteTag(repo, tag)
 	s.del(s.TagKey(repo, tag))
+	s.forgetPush(repo, tag)
+}
+
+// TagPushedAt is when a tag loaded at Open was last pushed. A tag written since
+// is not answered for: the collector saw that push itself.
+func (s *Store) TagPushedAt(repo, tag string) (time.Time, bool) {
+	s.pushMu.Lock()
+	defer s.pushMu.Unlock()
+	pushed, ok := s.loadedPushes[s.TagKey(repo, tag)]
+	return pushed, ok
+}
+
+func (s *Store) forgetPush(repo, tag string) {
+	s.pushMu.Lock()
+	defer s.pushMu.Unlock()
+	delete(s.loadedPushes, s.TagKey(repo, tag))
 }
 
 func (s *Store) RangeTags(repo string, fn func(tag string, digest v1.Hash) bool) {

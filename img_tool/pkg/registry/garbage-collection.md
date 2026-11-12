@@ -143,6 +143,28 @@ zero.
 Reading a tag refreshes it, so a `TagTTL` evicts the tags nobody pulls rather than the
 tags that are merely old.
 
+## Keeping the newest images
+
+| Flag | Default | What it bounds |
+| --- | --- | --- |
+| `--tag-keep-last <n>` | `0` | Per repository, the tags of the newest `n` images stay whatever their age. Every older tag goes unless it was read within `--tag-ttl`. `0` turns this off. |
+
+A registry fed one dated tag per CI build answers "keep the last two builds" with
+`--tag-keep-last 2`. A TTL cannot say that: a repository that builds daily and one that
+builds yearly need different TTLs for the same answer.
+
+- **An image is a tagged manifest.** `latest` and a dated tag naming the same build take
+  one slot, not two. A tag pointing at a manifest the registry does not hold takes none.
+- **Images are ranked by their newest push.** Re-pushing a tag moves its image to the
+  front. Reads do not change the order.
+- **Older images stay while they are read.** `--tag-ttl` bounds them, now counting only
+  reads. A deployment pinned to an old tag keeps it as long as something pulls that tag
+  within `--tag-ttl`, so set `--tag-ttl` comfortably above the gap between those pulls.
+- **After a restart, push times come from the store.** `s3store` uses each tag object's
+  `LastModified`. Ties fall back to the tag name, so dated tags still sort right in a
+  store that cannot say. Every adopted tag counts as just read, so an old tag gets one
+  `--tag-ttl` to be pulled again before it goes.
+
 ## Collecting a blob
 
 Two things can happen to a collected blob, and they are configured in different
@@ -224,4 +246,4 @@ with no `TTL` tracks the object graph without ever collecting from it.
   for the length of a multi-step operation. That would be the principled fix for a
   push slow enough that its digest-only children could expire before the index
   arrives, which today is handled by a `TTL` comfortably longer than a push.
-- **Size or count caps.** Retention is time and reachability, nothing else.
+- **Size caps.** Retention is time, reachability and `--tag-keep-last`, nothing else.

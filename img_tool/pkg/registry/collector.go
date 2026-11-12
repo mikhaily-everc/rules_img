@@ -15,6 +15,7 @@
 package registry
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -58,6 +59,7 @@ type Collector struct {
 
 	ttl      time.Duration
 	tagTTL   time.Duration
+	keepLast int
 	interval time.Duration
 	now      func() time.Time
 
@@ -68,6 +70,8 @@ type Collector struct {
 	lastSweep     time.Time
 	manifests     map[manifestKey]time.Time
 	tags          map[tagKey]time.Time
+	tagPushed     map[tagKey]time.Time
+	tagRead       map[tagKey]time.Time
 	blobs         map[v1.Hash]*blobNode
 	blobCollected []func(repo string, digest v1.Hash)
 }
@@ -86,6 +90,13 @@ type CollectorConfig struct {
 	// push a tag. Callers that have a way to tell an unset setting from an
 	// explicit zero, such as a command line, should default it to TTL.
 	TagTTL time.Duration
+
+	// TagKeepLast, when positive, keeps the tags of the newest TagKeepLast
+	// images in each repository whatever their age, and lets every older tag go
+	// unless it was read within TagTTL. An image is a tagged manifest, ranked by
+	// the latest push of any tag naming it, so `latest` and a dated tag on the
+	// same build count once. Zero leaves retention to TagTTL alone.
+	TagKeepLast int
 
 	// Interval is the shortest gap between two sweeps triggered by
 	// MaybeCollect. Zero defaults to a tenth of TTL. Requests in between are
@@ -152,11 +163,14 @@ func NewCollector(store Store, cfg CollectorConfig) *Collector {
 		store:     store,
 		ttl:       cfg.TTL,
 		tagTTL:    cfg.TagTTL,
+		keepLast:  cfg.TagKeepLast,
 		interval:  interval,
 		now:       now,
 		lastSweep: now(),
 		manifests: make(map[manifestKey]time.Time),
 		tags:      make(map[tagKey]time.Time),
+		tagPushed: make(map[tagKey]time.Time),
+		tagRead:   make(map[tagKey]time.Time),
 		blobs:     make(map[v1.Hash]*blobNode),
 	}
 }
@@ -190,14 +204,31 @@ func (c *Collector) TouchManifest(repo string, digest v1.Hash) {
 	c.manifests[manifestKey{repo: repo, digest: digest}] = c.now()
 }
 
-// TouchTag records that a tag was just written or resolved.
+// TouchTag records that a tag was just resolved.
 func (c *Collector) TouchTag(repo, tag string) {
 	if c == nil {
 		return
 	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.tags[tagKey{repo: repo, tag: tag}] = c.now()
+	key := tagKey{repo: repo, tag: tag}
+	now := c.now()
+	c.tags[key] = now
+	c.tagRead[key] = now
+}
+
+// PushTag records that a tag was just written. A push refreshes the tag like a
+// read does, and is also what TagKeepLast ranks images by.
+func (c *Collector) PushTag(repo, tag string) {
+	if c == nil {
+		return
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	key := tagKey{repo: repo, tag: tag}
+	now := c.now()
+	c.tags[key] = now
+	c.tagPushed[key] = now
 }
 
 // TouchBlob records that a blob was just stored, served, or named by a manifest
@@ -241,7 +272,13 @@ func (c *Collector) ForgetTag(repo, tag string) {
 	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	delete(c.tags, tagKey{repo: repo, tag: tag})
+	c.dropTagLocked(tagKey{repo: repo, tag: tag})
+}
+
+func (c *Collector) dropTagLocked(key tagKey) {
+	delete(c.tags, key)
+	delete(c.tagPushed, key)
+	delete(c.tagRead, key)
 }
 
 // ForgetBlob drops a deleted blob's bookkeeping.
@@ -281,7 +318,7 @@ func (c *Collector) writing() func() {
 // sweep. Handlers call it before serving a request, so a request arriving after
 // something expired does not see it.
 func (c *Collector) MaybeCollect() {
-	if c == nil || (c.ttl <= 0 && c.tagTTL <= 0) {
+	if c == nil || (c.ttl <= 0 && c.tagTTL <= 0 && c.keepLast <= 0) {
 		return
 	}
 
@@ -395,6 +432,10 @@ func (c *Collector) markLocked() liveSet {
 			}
 			return true
 		})
+		if c.keepLast > 0 {
+			worklist = c.markNewestLocked(repo, graph, now, &live, worklist)
+			return true
+		}
 		c.store.RangeTags(repo, func(tag string, digest v1.Hash) bool {
 			key := tagKey{repo: repo, tag: tag}
 			lastUsed, tracked := c.tags[key]
@@ -448,6 +489,87 @@ func (c *Collector) markLocked() liveSet {
 	return live
 }
 
+// markNewestLocked picks repo's tag roots under TagKeepLast: every tag of the
+// newest keepLast images, plus older tags read within TagTTL. Tags the Collector
+// has not seen yet are roots, as everywhere else. It must be called with the
+// lock held, after graph holds repo's manifests.
+func (c *Collector) markNewestLocked(repo string, graph map[manifestKey]references, now time.Time, live *liveSet, worklist []manifestKey) []manifestKey {
+	type image struct {
+		digest v1.Hash
+		pushed time.Time
+		tag    string
+	}
+	tagged := make(map[v1.Hash][]string)
+	images := make(map[v1.Hash]*image)
+	c.store.RangeTags(repo, func(tag string, digest v1.Hash) bool {
+		tagged[digest] = append(tagged[digest], tag)
+		if _, held := graph[manifestKey{repo: repo, digest: digest}]; !held {
+			// A dangling tag must not take a slot from an image that exists.
+			return true
+		}
+		pushed := c.pushedAtLocked(tagKey{repo: repo, tag: tag})
+		img, ok := images[digest]
+		if !ok {
+			images[digest] = &image{digest: digest, pushed: pushed, tag: tag}
+			return true
+		}
+		if pushed.After(img.pushed) || (pushed.Equal(img.pushed) && tag > img.tag) {
+			img.pushed, img.tag = pushed, tag
+		}
+		return true
+	})
+
+	ranked := make([]*image, 0, len(images))
+	for _, img := range images {
+		ranked = append(ranked, img)
+	}
+	// Ties fall back to the tag name, so dated tags still order correctly in a
+	// store that cannot say when they were pushed.
+	sort.Slice(ranked, func(i, j int) bool {
+		if !ranked[i].pushed.Equal(ranked[j].pushed) {
+			return ranked[i].pushed.After(ranked[j].pushed)
+		}
+		return ranked[i].tag > ranked[j].tag
+	})
+	newest := make(map[v1.Hash]struct{}, c.keepLast)
+	for i := 0; i < len(ranked) && i < c.keepLast; i++ {
+		newest[ranked[i].digest] = struct{}{}
+	}
+
+	for digest, tags := range tagged {
+		_, keep := newest[digest]
+		for _, tag := range tags {
+			key := tagKey{repo: repo, tag: tag}
+			_, tracked := c.tags[key]
+			read, wasRead := c.tagRead[key]
+			switch {
+			case !tracked:
+				live.untrackedTags[key] = struct{}{}
+			case keep, wasRead && c.fresh(read, now, c.tagTTL):
+			default:
+				live.staleTags[key] = struct{}{}
+				continue
+			}
+			worklist = append(worklist, manifestKey{repo: repo, digest: digest})
+		}
+	}
+	return worklist
+}
+
+// pushedAtLocked is when a tag was last pushed: as this Collector saw it, else
+// as the store remembers it, else the zero time.
+func (c *Collector) pushedAtLocked(key tagKey) time.Time {
+	if pushed, ok := c.tagPushed[key]; ok {
+		return pushed
+	}
+	if times, ok := c.store.(TagPushTimes); ok {
+		if pushed, ok := times.TagPushedAt(key.repo, key.tag); ok {
+			return pushed
+		}
+	}
+	return time.Time{}
+}
+
 // blobFromDescriptor merges what a descriptor says about a blob with what the
 // Collector already knows, preferring the tracked node's size and last-used
 // time.
@@ -477,8 +599,11 @@ func (c *Collector) sweepLocked(live liveSet) (CollectStats, []LiveBlob) {
 	for key := range live.untrackedManifests {
 		c.manifests[key] = now
 	}
+	// An adopted tag counts as just read: after a restart nothing knows who
+	// reads what, so each old tag gets one TagTTL to be read again.
 	for key := range live.untrackedTags {
 		c.tags[key] = now
+		c.tagRead[key] = now
 	}
 
 	for key := range c.manifests {
@@ -495,7 +620,7 @@ func (c *Collector) sweepLocked(live liveSet) (CollectStats, []LiveBlob) {
 	for key := range c.tags {
 		digest, held := c.store.ResolveTag(key.repo, key.tag)
 		if !held {
-			delete(c.tags, key)
+			c.dropTagLocked(key)
 			continue
 		}
 		_, stale := live.staleTags[key]
@@ -503,7 +628,7 @@ func (c *Collector) sweepLocked(live liveSet) (CollectStats, []LiveBlob) {
 			// Either the tag itself expired, or it points at a manifest that is
 			// gone -- a dangling tag resolves to a 404 either way.
 			c.store.DeleteTag(key.repo, key.tag)
-			delete(c.tags, key)
+			c.dropTagLocked(key)
 			stats.Tags++
 		}
 	}

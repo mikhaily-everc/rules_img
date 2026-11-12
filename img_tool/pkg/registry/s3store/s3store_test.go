@@ -41,6 +41,7 @@ type object struct {
 	body        []byte
 	contentType *string
 	metadata    map[string]string
+	modified    time.Time
 }
 
 // fakeS3 is a single-bucket, in-memory S3 with an optional run of injected put failures.
@@ -49,6 +50,8 @@ type fakeS3 struct {
 	objects    map[string]object
 	failPuts   int
 	puts, dels int
+	// now stamps each put as its LastModified.
+	now time.Time
 }
 
 func newFake() *fakeS3 { return &fakeS3{objects: map[string]object{}} }
@@ -75,7 +78,7 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 		return nil, err
 	}
 	f.puts++
-	f.objects[aws.ToString(in.Key)] = object{body: body, contentType: in.ContentType, metadata: in.Metadata}
+	f.objects[aws.ToString(in.Key)] = object{body: body, contentType: in.ContentType, metadata: in.Metadata, modified: f.now}
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -105,7 +108,7 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ .
 			out.NextContinuationToken = aws.String(keys[1])
 			break
 		}
-		out.Contents = append(out.Contents, s3types.Object{Key: aws.String(k)})
+		out.Contents = append(out.Contents, s3types.Object{Key: aws.String(k), LastModified: aws.Time(f.objects[k].modified)})
 	}
 	return out, nil
 }
@@ -152,6 +155,31 @@ func TestRestartRestoresManifestsAndTags(t *testing.T) {
 		if !ok || m.Kind != registry.KindManifest || m.ContentType != "application/vnd.oci.image.manifest.v1+json" {
 			t.Fatalf("%s@%s = %+v, %v", repo, got, m, ok)
 		}
+	}
+}
+
+func TestRestartRemembersWhenTagsWerePushed(t *testing.T) {
+	f := newFake()
+	s := open(t, f)
+	d, m := manifest(t, `{"pushed":1}`)
+	s.PutManifest("repo", d, m)
+	older := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	f.now = older
+	s.PutTag("repo", "old", d)
+	f.now = older.Add(time.Hour)
+	s.PutTag("repo", "new", d)
+
+	restarted := open(t, f)
+	for tag, want := range map[string]time.Time{"old": older, "new": older.Add(time.Hour)} {
+		if got, ok := restarted.TagPushedAt("repo", tag); !ok || !got.Equal(want) {
+			t.Fatalf("TagPushedAt(%s) = %v, %v; want %v", tag, got, ok, want)
+		}
+	}
+
+	// A push after Open is the collector's to record, so the stale time must go.
+	restarted.PutTag("repo", "old", d)
+	if _, ok := restarted.TagPushedAt("repo", "old"); ok {
+		t.Fatal("a tag re-pushed after Open still reports its load-time push")
 	}
 }
 

@@ -45,6 +45,7 @@ func Run(ctx context.Context, args []string) {
 	var toolInvocationID string
 	var manifestTTL time.Duration
 	var tagTTLFlag optionalDuration
+	var tagKeepLast int
 	var casKeepAlive bool
 	var remoteCacheTTL time.Duration
 	var keepAliveScanInterval time.Duration
@@ -86,6 +87,7 @@ func Run(ctx context.Context, args []string) {
 	flagSet.StringVar(&toolInvocationID, "invocation_id", "", "Alias for --invocation-id")
 	flagSet.DurationVar(&manifestTTL, "ttl", 0, "How long a manifest or blob is kept after it was last pushed or pulled. Anything a tag or an unexpired index still references is kept regardless of its own age. 0 keeps everything until the process exits.")
 	flagSet.Var(&tagTTLFlag, "tag-ttl", "How long a tag is kept after it was last pushed or read. Defaults to --ttl, since a tag keeps everything it references alive. Set 0 to keep tags -- and their images -- forever.")
+	flagSet.IntVar(&tagKeepLast, "tag-keep-last", 0, "Keep the tags of the newest N images in each repository whatever their age; older tags go unless read within --tag-ttl. 0 leaves retention to --tag-ttl alone.")
 	flagSet.BoolVar(&casKeepAlive, "cas-keepalive", false, `Periodically ask the remote cache about live blobs so it keeps them. Requires the "reapi" blob store.`)
 	flagSet.DurationVar(&remoteCacheTTL, "cas-remote-cache-ttl", 24*time.Hour, "How long the remote cache is believed to keep a blob nobody asks about. Used with --cas-keepalive.")
 	flagSet.DurationVar(&keepAliveScanInterval, "cas-keepalive-scan-interval", time.Hour, "How often --cas-keepalive wakes up to look for blobs due a refresh. Keep it well under half of --cas-remote-cache-ttl.")
@@ -102,8 +104,8 @@ func Run(ctx context.Context, args []string) {
 	// A tag keeps everything it references alive, so bounding manifests without
 	// bounding tags would bound nothing for a client that always pushes one.
 	tagTTL := tagTTLFlag.orElse(manifestTTL)
-	if manifestTTL < 0 || tagTTL < 0 {
-		fmt.Fprintln(os.Stderr, "Error: --ttl and --tag-ttl must be non-negative")
+	if manifestTTL < 0 || tagTTL < 0 || tagKeepLast < 0 {
+		fmt.Fprintln(os.Stderr, "Error: --ttl, --tag-ttl and --tag-keep-last must be non-negative")
 		flagSet.Usage()
 		os.Exit(1)
 	}
@@ -263,10 +265,11 @@ func Run(ctx context.Context, args []string) {
 		store = s3Store
 	}
 	var collector *registry.Collector
-	if manifestTTL > 0 || tagTTL > 0 || casKeepAlive {
+	if manifestTTL > 0 || tagTTL > 0 || tagKeepLast > 0 || casKeepAlive {
 		collector = registry.NewCollector(store, registry.CollectorConfig{
-			TTL:    manifestTTL,
-			TagTTL: tagTTL,
+			TTL:         manifestTTL,
+			TagTTL:      tagTTL,
+			TagKeepLast: tagKeepLast,
 		})
 		// A blob's size outlives nothing: once no manifest names the blob any
 		// more, the size we learned from that manifest is just stale metadata.
