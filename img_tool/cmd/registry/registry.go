@@ -264,6 +264,10 @@ func Run(ctx context.Context, args []string) {
 		}
 		store = s3Store
 	}
+	if seeded := blobSizeCache.Seed(store); seeded > 0 {
+		log.Printf("blob size cache: seeded from %d stored manifest(s)", seeded)
+	}
+
 	var collector *registry.Collector
 	if manifestTTL > 0 || tagTTL > 0 || tagKeepLast > 0 || casKeepAlive {
 		collector = registry.NewCollector(store, registry.CollectorConfig{
