@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "reapi",
@@ -11,5 +11,17 @@ go_library(
         "//pkg/serve/registry",
         "@com_github_google_go_containerregistry//pkg/v1:pkg",
         "@org_golang_google_grpc//:grpc",
+    ],
+)
+
+go_test(
+    name = "reapi_test",
+    srcs = ["reapi_test.go"],
+    embed = [":reapi"],
+    deps = [
+        "//pkg/cas",
+        "//pkg/registry",
+        "//pkg/serve/registry",
+        "@com_github_google_go_containerregistry//pkg/v1:pkg",
     ],
 )
