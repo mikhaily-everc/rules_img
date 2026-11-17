@@ -30,6 +30,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
@@ -101,7 +102,7 @@ func New(opts ...Option) http.Handler {
 		log: log.New(os.Stderr, "", log.LstdFlags),
 		blobs: blobs{
 			blobHandler: &memHandler{m: map[string][]byte{}},
-			uploads:     map[string][]byte{},
+			uploads:     newUploadStore("", DefaultUploadTTL),
 			log:         log.New(os.Stderr, "", log.LstdFlags),
 		},
 		manifests:   manifests{log: log.New(os.Stderr, "", log.LstdFlags)},
@@ -211,6 +212,14 @@ func WithStore(store Store) Option {
 func WithCollector(collector *Collector) Option {
 	return func(r *registry) {
 		r.collector = collector
+	}
+}
+
+// WithUploadSpool sets where chunked uploads are spooled ("" is os.TempDir) and how long an idle
+// session's file survives before a new upload reclaims it (0 is DefaultUploadTTL).
+func WithUploadSpool(dir string, ttl time.Duration) Option {
+	return func(r *registry) {
+		r.blobs.uploads = newUploadStore(dir, ttl)
 	}
 }
 

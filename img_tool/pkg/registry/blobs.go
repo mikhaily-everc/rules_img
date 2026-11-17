@@ -166,12 +166,11 @@ func (m *memHandler) Delete(_ context.Context, _ string, h v1.Hash) error {
 type blobs struct {
 	blobHandler BlobHandler
 
-	// Each upload gets a unique id that writes occur to until finalized.
-	uploads         map[string][]byte
+	// Each upload gets a unique id whose spool file writes go to until finalized.
+	uploads         *uploadStore
 	createdCallback func(repo string, digest v1.Hash)
 	deletedCallback func(repo string, digest v1.Hash)
 	collector       *Collector
-	lock            sync.Mutex
 	log             *log.Logger
 }
 
@@ -397,6 +396,7 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 			return nil
 		}
 
+		b.uploads.sweep() // a new session is the moment to reclaim abandoned ones
 		id := fmt.Sprint(rand.Int63())
 		resp.Header().Set("Location", "/"+path.Join("v2", path.Join(elem[1:len(elem)-2]...), "blobs/uploads", id))
 		resp.Header().Set("Range", "0-0")
@@ -412,8 +412,9 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 			}
 		}
 
+		start := int64(-1) // a streamed PATCH: only a session's first write may be one
 		if contentRange != "" {
-			start, end := 0, 0
+			var end int64
 			if _, err := fmt.Sscanf(contentRange, "%d-%d", &start, &end); err != nil {
 				return &regError{
 					Status:  http.StatusRequestedRangeNotSatisfiable,
@@ -421,41 +422,27 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 					Message: "We don't understand your Content-Range",
 				}
 			}
-			b.lock.Lock()
-			defer b.lock.Unlock()
-			if start != len(b.uploads[target]) {
-				return &regError{
-					Status:  http.StatusRequestedRangeNotSatisfiable,
-					Code:    "BLOB_UPLOAD_UNKNOWN",
-					Message: "Your content range doesn't match what we have",
-				}
-			}
-			l := bytes.NewBuffer(b.uploads[target])
-			io.Copy(l, req.Body)
-			b.uploads[target] = l.Bytes()
-			resp.Header().Set("Location", "/"+path.Join("v2", path.Join(elem[1:len(elem)-3]...), "blobs/uploads", target))
-			resp.Header().Set("Range", fmt.Sprintf("0-%d", len(l.Bytes())-1))
-			// OCI Distribution spec §10.5 requires 202 Accepted for chunk uploads.
-			resp.WriteHeader(http.StatusAccepted)
-			return nil
 		}
-
-		b.lock.Lock()
-		defer b.lock.Unlock()
-		if _, ok := b.uploads[target]; ok {
+		defer req.Body.Close()
+		size, err := b.uploads.appendChunk(target, start, req.Body)
+		switch {
+		case errors.Is(err, errUploadOffset):
+			return &regError{
+				Status:  http.StatusRequestedRangeNotSatisfiable,
+				Code:    "BLOB_UPLOAD_UNKNOWN",
+				Message: "Your content range doesn't match what we have",
+			}
+		case errors.Is(err, errUploadStreamed):
 			return &regError{
 				Status:  http.StatusBadRequest,
 				Code:    "BLOB_UPLOAD_INVALID",
 				Message: "Stream uploads after first write are not allowed",
 			}
+		case err != nil:
+			return regErrInternal(err)
 		}
-
-		l := &bytes.Buffer{}
-		io.Copy(l, req.Body)
-
-		b.uploads[target] = l.Bytes()
 		resp.Header().Set("Location", "/"+path.Join("v2", path.Join(elem[1:len(elem)-3]...), "blobs/uploads", target))
-		resp.Header().Set("Range", fmt.Sprintf("0-%d", len(l.Bytes())-1))
+		resp.Header().Set("Range", fmt.Sprintf("0-%d", size-1))
 		// OCI Distribution spec §10.5 requires 202 Accepted for chunk uploads.
 		resp.WriteHeader(http.StatusAccepted)
 		return nil
@@ -482,9 +469,6 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 			}
 		}
 
-		b.lock.Lock()
-		defer b.lock.Unlock()
-
 		h, err := v1.NewHash(digest)
 		if err != nil {
 			return &regError{
@@ -495,11 +479,19 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 		}
 
 		defer req.Body.Close()
-		in := io.NopCloser(io.MultiReader(bytes.NewBuffer(b.uploads[target]), req.Body))
+		// The spooled chunks, then any trailing body: streamed, never loaded. The session goes
+		// whatever Put says; a client retries a failed PUT with a fresh upload.
+		var spooled io.Reader = bytes.NewReader(nil)
+		var spooledSize int64
+		if sess := b.uploads.take(target); sess != nil {
+			defer sess.discard()
+			spooled, spooledSize = sess.reader(), sess.size
+		}
+		in := io.NopCloser(io.MultiReader(spooled, req.Body))
 
 		size := int64(verify.SizeUnknown)
 		if req.ContentLength > 0 {
-			size = int64(len(b.uploads[target])) + req.ContentLength
+			size = spooledSize + req.ContentLength
 		}
 
 		vrc, err := verify.ReadCloser(in, size, h)
@@ -516,7 +508,6 @@ func (b *blobs) handle(resp http.ResponseWriter, req *http.Request) *regError {
 			return regErrInternal(err)
 		}
 
-		delete(b.uploads, target)
 		if b.createdCallback != nil {
 			b.createdCallback(repo, h)
 		}
