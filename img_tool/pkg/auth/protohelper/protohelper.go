@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -19,6 +20,9 @@ import (
 	credhelper "github.com/bazel-contrib/rules_img/img_tool/pkg/auth/credential"
 	"github.com/bazel-contrib/rules_img/img_tool/pkg/auth/grpcheaderinterceptor"
 )
+
+// reconnectMaxDelay caps the wait between redials of a lost connection.
+const reconnectMaxDelay = 5 * time.Second
 
 // EnvMaxRecvMsgSize overrides, in bytes, the largest gRPC message the clients built here
 // will accept. It follows the IMG_REAPI_* convention of pkg/cas, though it reaches every
@@ -179,6 +183,20 @@ func client(uri string, helper credhelper.Helper, requestMetadata grpcheaderinte
 	opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
 		Time:    5 * time.Minute,
 		Timeout: 20 * time.Second,
+	}))
+
+	// Reconnect at most 5s apart, not grpc-go's 120s. While a channel waits to
+	// redial, every RPC fails with the last dial error without trying, so after a
+	// 3.6m CAS restart (2026-11-19 11:36) the registry kept answering 500 for
+	// 3 more minutes against a CAS that was already Ready. Other knobs stay default.
+	opts = append(opts, grpc.WithConnectParams(grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay:  backoff.DefaultConfig.BaseDelay,
+			Multiplier: backoff.DefaultConfig.Multiplier,
+			Jitter:     backoff.DefaultConfig.Jitter,
+			MaxDelay:   reconnectMaxDelay,
+		},
+		MinConnectTimeout: 20 * time.Second,
 	}))
 
 	return grpc.NewClient(target, opts...)

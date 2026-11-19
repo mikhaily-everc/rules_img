@@ -63,7 +63,7 @@ type Config struct {
 	Backoff time.Duration
 	// Timeout bounds one S3 call. Defaults to 30s.
 	Timeout time.Duration
-	// LoadParallelism is how many manifests Open fetches at once. Defaults to 16.
+	// LoadParallelism is how many manifest and tag objects Open fetches at once. Defaults to 64.
 	LoadParallelism int
 }
 
@@ -78,7 +78,7 @@ func (c *Config) defaults() {
 		c.Timeout = 30 * time.Second
 	}
 	if c.LoadParallelism <= 0 {
-		c.LoadParallelism = 16
+		c.LoadParallelism = 64
 	}
 }
 
@@ -260,25 +260,39 @@ func (s *Store) load(ctx context.Context) error {
 		return first
 	}
 
+	// Tags in parallel too: read one by one, 7709 of them held the only replica unready 3m16s (2026-11-19).
 	for _, key := range tagKeys {
 		repo, tag, err := parseTagKey(strings.TrimPrefix(key, s.prefix))
 		if err != nil {
 			log.Printf("s3store: skipping %s: %v", key, err)
 			continue
 		}
-		body, _, err := s.get(ctx, key)
-		if err != nil {
-			return fmt.Errorf("s3store: reading %s: %w", key, err)
-		}
-		digest, err := v1.NewHash(strings.TrimSpace(string(body)))
-		if err != nil {
-			log.Printf("s3store: skipping %s: %v", key, err)
-			continue
-		}
-		s.mem.PutTag(repo, tag, digest)
-		if modified, ok := tagModified[key]; ok {
-			s.loadedPushes[s.TagKey(repo, tag)] = modified
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			body, _, err := s.get(ctx, key)
+			if err != nil {
+				fail(fmt.Errorf("s3store: reading %s: %w", key, err))
+				return
+			}
+			digest, err := v1.NewHash(strings.TrimSpace(string(body)))
+			if err != nil {
+				log.Printf("s3store: skipping %s: %v", key, err)
+				return
+			}
+			s.mem.PutTag(repo, tag, digest)
+			if modified, ok := tagModified[key]; ok {
+				s.pushMu.Lock()
+				s.loadedPushes[s.TagKey(repo, tag)] = modified
+				s.pushMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if first != nil {
+		return first
 	}
 	log.Printf("s3store: loaded %d manifest(s) and %d tag(s) from s3://%s/%s", len(manifestKeys), len(tagKeys), s.bucket, s.prefix)
 	return nil
