@@ -9,6 +9,7 @@ go_library(
         "//pkg/auth/credential",
         "//pkg/auth/grpcheaderinterceptor",
         "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//backoff",
         "@org_golang_google_grpc//credentials",
         "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//keepalive",

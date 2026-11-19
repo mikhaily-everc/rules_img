@@ -158,6 +158,57 @@ func TestRestartRestoresManifestsAndTags(t *testing.T) {
 	}
 }
 
+// slowTagReads delays every tag read and records how many run at once.
+type slowTagReads struct {
+	*fakeS3
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+}
+
+func (s *slowTagReads) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	if !strings.Contains(aws.ToString(in.Key), "/"+tagsDir) {
+		return s.fakeS3.GetObject(ctx, in, opts...)
+	}
+	s.mu.Lock()
+	s.inFlight++
+	s.peak = max(s.peak, s.inFlight)
+	s.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	s.mu.Lock()
+	s.inFlight--
+	s.mu.Unlock()
+	return s.fakeS3.GetObject(ctx, in, opts...)
+}
+
+func TestOpenReadsTagsInParallel(t *testing.T) {
+	f := newFake()
+	s := open(t, f)
+	d, m := manifest(t, `{"parallel":1}`)
+	s.PutManifest("repo", d, m)
+	const tags = 32
+	for i := range tags {
+		s.PutTag("repo", "t"+strings.Repeat("x", i), d)
+	}
+
+	slow := &slowTagReads{fakeS3: f}
+	restarted, err := Open(context.Background(), slow, "bucket", "cas-registry", Config{Backoff: time.Millisecond, LoadParallelism: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slow.peak < 2 {
+		t.Fatalf("tag reads ran %d at a time; a sequential load kept the registry unready for minutes", slow.peak)
+	}
+	if slow.peak > 8 {
+		t.Fatalf("tag reads ran %d at a time, over LoadParallelism 8", slow.peak)
+	}
+	for i := range tags {
+		if got, ok := restarted.ResolveTag("repo", "t"+strings.Repeat("x", i)); !ok || got != d {
+			t.Fatalf("tag %d = %v, %v; want %v", i, got, ok, d)
+		}
+	}
+}
+
 func TestRestartRemembersWhenTagsWerePushed(t *testing.T) {
 	f := newFake()
 	s := open(t, f)
